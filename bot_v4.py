@@ -248,16 +248,11 @@ class Database:
         total_seconds = plan_limits.get(plan, 86400)
         power = plan_power.get(plan, 30.0)
 
-        conn = sqlite3.connect(self.db_file)
-        c = conn.cursor()
-        try:
+        with sqlite3.connect(self.db_file) as conn:
+            c = conn.cursor()
             c.execute("INSERT INTO bots (user_id, token, name, folder, main_file, total_seconds, remaining_seconds, power_max, power_remaining) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", 
                       (user_id, token, name, folder, main_file, total_seconds, total_seconds, power, power))
-            bot_id = c.lastrowid
-            conn.commit()
-            return bot_id
-        finally:
-            conn.close()
+            return c.lastrowid
 
     def get_user_bots(self, user_id):
         conn = sqlite3.connect(self.db_file)
@@ -469,7 +464,8 @@ class ProcessManager:
             # Set start_time and last_checked if not set
             now = int(time.time())
             if not start_time:
-                conn = sqlite3.connect(db.db_file); c = conn.cursor(); c.execute("UPDATE bots SET start_time = ?, last_checked = ? WHERE id = ?", (now, now, bot_id)); conn.commit(); conn.close()
+                with sqlite3.connect(db.db_file) as conn:
+                    conn.execute("UPDATE bots SET start_time = ?, last_checked = ? WHERE id = ?", (now, datetime.utcnow().isoformat(), bot_id))
             else:
                 db.update_last_checked(bot_id)
 
@@ -477,8 +473,8 @@ class ProcessManager:
             db.reset_restart_count(bot_id)
 
             # Watch errors and process exit
-            asyncio.create_task(self.watch_errors(bot_id, stderr_file, user_id, application))
-            asyncio.create_task(self._watch_process_exit(bot_id, p, user_id, application))
+            application.create_task(self.watch_errors(bot_id, stderr_file, user_id, application))
+            application.create_task(self._watch_process_exit(bot_id, p, user_id, application))
             return True, "🚀 تم التشغيل بنجاح."
         except Exception as e:
             logger.exception("Failed to start bot %s: %s", bot_id, e)
@@ -675,7 +671,8 @@ class ProcessManager:
                     if new_remaining > 0 and new_remaining <= 600 and not warned_low:
                         try:
                             await application.bot.send_message(chat_id=bot[1], text=f"⚠️ تنبيه: البوت {bot[3]} سيتوقف خلال {seconds_to_human(new_remaining)}. يرجى إضافة وقت لتجنب السكون.")
-                            conn = sqlite3.connect(DB_FILE); c = conn.cursor(); c.execute("UPDATE bots SET warned_low = 1 WHERE id = ?", (bot_id,)); conn.commit(); conn.close()
+                            with sqlite3.connect(DB_FILE) as conn:
+                                conn.execute("UPDATE bots SET warned_low = 1 WHERE id = ?", (bot_id,))
                         except Exception as e:
                             logger.exception("Failed to send low-time warning to user %s for bot %s: %s", bot[1], bot_id, e)
 
@@ -697,7 +694,7 @@ class ProcessManager:
 
     async def start_background_tasks(self, application):
         if self._enforce_task is None:
-            self._enforce_task = asyncio.create_task(self._enforce_loop(application))
+            self._enforce_task = application.create_task(self._enforce_loop(application))
 
 pm = ProcessManager()
 
@@ -912,7 +909,7 @@ async def manage_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
     # Start auto-refresh task
-    asyncio.create_task(auto_refresh_task(update, context, bot_id))
+    context.application.create_task(auto_refresh_task(update, context, bot_id))
 
 # --- UPDATED LOGS VIEW ---
 async def view_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1027,7 +1024,8 @@ async def add_time_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_remaining = (bot[11] or 0) + seconds
     new_power = min(100.0, (bot[13] or 0) + added_power)
     db.update_bot_resources(bot_id, remaining_seconds=new_remaining, power_remaining=new_power, last_checked=datetime.utcnow().isoformat())
-    conn = sqlite3.connect(DB_FILE); c = conn.cursor(); c.execute("UPDATE bots SET total_seconds = ?, warned_low = 0 WHERE id = ?", (new_total, bot_id)); conn.commit(); conn.close()
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("UPDATE bots SET total_seconds = ?, warned_low = 0 WHERE id = ?", (new_total, bot_id))
 
     # Wake up if sleeping
     if bot[15] == 1:
@@ -1388,7 +1386,10 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     # Start background enforcement/monitor tasks when app starts
-    app.post_init = lambda _: asyncio.create_task(pm.start_background_tasks(app))
+    async def post_init(application):
+        await pm.start_background_tasks(application)
+    
+    app.post_init = post_init
     app.add_handler(add_bot_conv)
     app.add_handler(feedback_conv)
     app.add_handler(gh_conv)
