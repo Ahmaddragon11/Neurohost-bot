@@ -45,6 +45,49 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# -- File logging for uncaught exceptions and runtime errors --
+from logging.handlers import RotatingFileHandler
+
+ERROR_LOG_FILE = os.getenv("NEUROHOST_ERROR_LOG", "neurohost_errors.log")
+
+def setup_file_logging(log_file=ERROR_LOG_FILE):
+    try:
+        os.makedirs(os.path.dirname(log_file) or '.', exist_ok=True)
+        fh = RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+        fh.setLevel(logging.ERROR)
+        fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
+        logging.getLogger().addHandler(fh)
+    except Exception as e:
+        # If file logging cannot be set up, ensure at least console logger continues
+        logger.warning("Failed to set up file logging: %s", e)
+
+# Catch unhandled exceptions from threads/processes
+def handle_uncaught_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        # let default handler handle keyboard interrupt
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    logger.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+    try:
+        with open(ERROR_LOG_FILE, 'a', encoding='utf-8') as ef:
+            ef.write(f"\n===== Uncaught exception: {datetime.utcnow().isoformat()} =====\n")
+            import traceback
+            traceback.print_exception(exc_type, exc_value, exc_traceback, file=ef)
+    except Exception:
+        pass
+
+sys.excepthook = handle_uncaught_exception
+
+# Asyncio exception handler
+def asyncio_exception_handler(loop, context):
+    try:
+        msg = context.get("exception") or context.get("message")
+        logger.error("Asyncio exception: %s", msg)
+        with open(ERROR_LOG_FILE, 'a', encoding='utf-8') as ef:
+            ef.write(f"\n===== Asyncio exception: {datetime.utcnow().isoformat()} =====\n{msg}\n")
+    except Exception:
+        pass
+
 # --- Helpers for V4 ---
 
 def seconds_to_human(s):
@@ -64,7 +107,8 @@ def seconds_to_human(s):
 def render_bar(percent, length=12):
     try:
         p = max(0, min(100, int(percent)))
-    except:
+    except Exception as e:
+        logger.exception("render_bar failed to parse percent %r: %s", percent, e)
         p = 0
     full = int((p / 100.0) * length)
     return '█' * full + '░' * (length - full) + f" {p}%"
@@ -437,6 +481,14 @@ class ProcessManager:
             asyncio.create_task(self._watch_process_exit(bot_id, p, user_id, application))
             return True, "🚀 تم التشغيل بنجاح."
         except Exception as e:
+            logger.exception("Failed to start bot %s: %s", bot_id, e)
+            try:
+                with open(ERROR_LOG_FILE, 'a', encoding='utf-8') as ef:
+                    import traceback
+                    ef.write(f"\n===== Bot start exception ({bot_id}): {datetime.utcnow().isoformat()} =====\n")
+                    traceback.print_exc(file=ef)
+            except Exception:
+                pass
             return False, str(e)
 
     async def _watch_process_exit(self, bot_id, process, user_id, application):
@@ -470,8 +522,10 @@ class ProcessManager:
         if restart_count >= self.restart_anti_loop_limit:
             db.set_sleep_mode(bot_id, True, reason="anti_loop")
             db.log_restart_event(bot_id, "Auto-restart disabled due to too many restarts.")
-            try: await application.bot.send_message(chat_id=bot[1], text=f"⚠️ البوت {bot[3]} تم إيقافه آلياً بسبب تكرار الإعادات.")
-            except: pass
+            try:
+                await application.bot.send_message(chat_id=bot[1], text=f"⚠️ البوت {bot[3]} تم إيقافه آلياً بسبب تكرار الإعادات.")
+            except Exception as e:
+                logger.exception("Failed to notify user %s about auto-sleep for bot %s: %s", bot[1], bot[3], e)
             return
 
         # Check cooldown
@@ -481,7 +535,8 @@ class ProcessManager:
                 if (datetime.utcnow() - lr).total_seconds() < self.restart_cooldown:
                     db.log_restart_event(bot_id, "Restart skipped due to cooldown.")
                     return
-            except: pass
+            except Exception as e:
+                logger.exception("Failed to evaluate restart cooldown for bot %s: %s", bot_id, e)
 
         # If no time/power, try auto-recovery (if user still has daily recovery and not used for this bot)
         if (remaining_seconds <= 0 or power_remaining <= 0) and db.can_user_recover(bot[1]) and auto_recovery_used == 0:
@@ -491,15 +546,19 @@ class ProcessManager:
             db.log_restart_event(bot_id, "Auto-recovery used to restart bot for free.")
             success, msg = await self.start_bot(bot_id, application, use_recovery=True)
             if success:
-                try: await application.bot.send_message(chat_id=bot[1], text=f"🔄 تم استعادة {bot[3]} باستخدام Auto-Recovery المجانية.")
-                except: pass
+                try:
+                    await application.bot.send_message(chat_id=bot[1], text=f"🔄 تم استعادة {bot[3]} باستخدام Auto-Recovery المجانية.")
+                except Exception as e:
+                    logger.exception("Failed to notify user %s after auto-recovery for bot %s: %s", bot[1], bot[3], e)
                 return
 
         # If still no resources, do not restart
         if remaining_seconds <= 0 or power_remaining <= 0 or sleep_mode:
             db.set_sleep_mode(bot_id, True, reason="expired_or_no_power")
-            try: await application.bot.send_message(chat_id=bot[1], text=f"⚠️ البوت {bot[3]} توقف بسبب نفاد الوقت أو الطاقة ودخل وضع السكون.")
-            except: pass
+            try:
+                await application.bot.send_message(chat_id=bot[1], text=f"⚠️ البوت {bot[3]} توقف بسبب نفاد الوقت أو الطاقة ودخل وضع السكون.")
+            except Exception as e:
+                logger.exception("Failed to notify user %s about sleep for bot %s: %s", bot[1], bot[3], e)
             return
 
         # Deduct restart cost
@@ -512,8 +571,10 @@ class ProcessManager:
         await asyncio.sleep(3)
         success, msg = await self.start_bot(bot_id, application)
         if success:
-            try: await application.bot.send_message(chat_id=bot[1], text=f"♻️ تم إعادة تشغيل البوت {bot[3]} تلقائياً.")
-            except: pass
+            try:
+                await application.bot.send_message(chat_id=bot[1], text=f"♻️ تم إعادة تشغيل البوت {bot[3]} تلقائياً.")
+            except Exception as e:
+                logger.exception("Failed to notify user %s after auto-restart for bot %s: %s", bot[1], bot[3], e)
         else:
             db.log_restart_event(bot_id, f"Auto-restart failed: {msg}")
 
@@ -542,7 +603,8 @@ class ProcessManager:
                                     text=f"⚠️ *تنبيه خطأ حقيقي في البوت: {bot_info[3]}*\n\n```\n{error_text[:500]}\n```",
                                     parse_mode="Markdown"
                                 )
-                            except: pass
+                            except Exception as e:
+                                logger.exception("Failed to send error notification to user %s for bot %s: %s", user_id, bot_id, e)
                 last_pos = os.path.getsize(log_file)
 
     def stop_bot(self, bot_id):
@@ -551,7 +613,8 @@ class ProcessManager:
         if pid:
             try:
                 os.killpg(os.getpgid(pid), signal.SIGTERM)
-            except: pass
+            except Exception as e:
+                logger.exception("Failed to terminate process %s for bot %s: %s", pid, bot_id, e)
         if bot_id in self.processes: del self.processes[bot_id]
         db.update_bot_status(bot_id, "stopped", None)
         return True
@@ -565,7 +628,9 @@ class ProcessManager:
                 proc = psutil.Process(pid)
                 if proc.is_running():
                     return proc.cpu_percent(interval=0.1), proc.memory_info().rss / 1024 / 1024
-            except: pass
+            except Exception as e:
+                logger.exception("psutil process info failed for pid %s: %s", pid, e)
+                return 0, 0
         return 0, 0
 
     # Background enforcement and monitoring
@@ -585,7 +650,8 @@ class ProcessManager:
                     # compute elapsed since last_checked
                     try:
                         last_ts = int(datetime.fromisoformat(last_checked).timestamp())
-                    except:
+                    except Exception as e:
+                        logger.exception("Failed to parse last_checked for bot %s: %s", bot_id, e)
                         last_ts = int(now)
                     elapsed = int(now - last_ts)
                     if elapsed <= 0:
@@ -610,14 +676,18 @@ class ProcessManager:
                         try:
                             await application.bot.send_message(chat_id=bot[1], text=f"⚠️ تنبيه: البوت {bot[3]} سيتوقف خلال {seconds_to_human(new_remaining)}. يرجى إضافة وقت لتجنب السكون.")
                             conn = sqlite3.connect(DB_FILE); c = conn.cursor(); c.execute("UPDATE bots SET warned_low = 1 WHERE id = ?", (bot_id,)); conn.commit(); conn.close()
-                        except: pass
+                        except Exception as e:
+                            logger.exception("Failed to send low-time warning to user %s for bot %s: %s", bot[1], bot_id, e)
+
 
                     # If now expired
                     if new_remaining == 0 or new_power == 0.0:
                         # enforce sleep
                         db.set_sleep_mode(bot_id, True, reason="expired")
-                        try: await application.bot.send_message(chat_id=bot[1], text=f"⚠️ البوت {bot[3]} دخل وضع السكون بسبب نفاد الوقت أو الطاقة.")
-                        except: pass
+                        try:
+                            await application.bot.send_message(chat_id=bot[1], text=f"⚠️ البوت {bot[3]} دخل وضع السكون بسبب نفاد الوقت أو الطاقة.")
+                        except Exception as e:
+                            logger.exception("Failed to notify user %s about sleep for bot %s: %s", bot[1], bot_id, e)
                         self.stop_bot(bot_id)
 
                 # cleanup / sleep
@@ -749,7 +819,8 @@ async def auto_refresh_task(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             if "Message is not modified" not in str(e):
                 context.user_data['auto_refresh'] = False
                 break
-        except:
+        except Exception as e:
+            logger.exception("Failed to update auto-refresh message for user %s, bot %s: %s", update.effective_user.id if update and update.effective_user else 'unknown', bot_id if 'bot_id' in locals() else 'unknown', e)
             context.user_data['auto_refresh'] = False
             break
 
@@ -1054,8 +1125,10 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "approve":
         db.update_user_status(user_id, 'approved')
         await query.edit_message_text(f"✅ تم قبول {user_id}")
-        try: await context.bot.send_message(chat_id=user_id, text="🎉 تم قبول طلبك!")
-        except: pass
+        try:
+            await context.bot.send_message(chat_id=user_id, text="🎉 تم قبول طلبك!")
+        except Exception as e:
+            logger.exception("Failed to send approval message to user %s: %s", user_id, e)
     else:
         db.update_user_status(user_id, 'blocked')
         await query.edit_message_text(f"❌ تم حظر {user_id}")
@@ -1081,7 +1154,9 @@ async def file_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()[:1000]
-    except: content = "لا يمكن العرض."
+    except Exception as e:
+        logger.exception("Failed to read file %s for viewing: %s", file_path, e)
+        content = "لا يمكن العرض."
     keyboard = [[InlineKeyboardButton("🗑 حذف", callback_data=f"fdel_{bot_id}_{filename}")], [InlineKeyboardButton("🔙 عودة", callback_data=f"files_{bot_id}")]]
     await query.edit_message_text(f"📄 `{filename}`\n\n```python\n{content}\n```", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
@@ -1119,10 +1194,11 @@ async def handle_bot_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Extract token
     token = None
     try:
-        with open(file_path, 'r') as f:
+        with open(file_path, 'r', encoding='utf-8') as f:
             match = re.search(r'[0-9]{8,10}:[a-zA-Z0-9_-]{35}', f.read())
             if match: token = match.group(0)
-    except: pass
+    except Exception as e:
+        logger.exception("Failed to read uploaded bot file %s: %s", file_path, e)
     
     context.user_data['new_bot'] = {'name': doc.file_name, 'folder': folder, 'main_file': doc.file_name}
     if token:
@@ -1190,7 +1266,8 @@ async def handle_github_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if m:
                             token = m.group(0)
                             break
-                except: pass
+                except Exception as e:
+                    logger.exception("Failed to read file %s while scanning for token: %s", os.path.join(root, f), e)
         if token: break
 
     # Detect requirements
@@ -1237,8 +1314,10 @@ async def handle_gh_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = context.user_data.get('gh_deploy')
     if data:
         # cleanup cloned folder
-        try: shutil.rmtree(data['path'], ignore_errors=True)
-        except: pass
+        try:
+            shutil.rmtree(data['path'], ignore_errors=True)
+        except Exception as e:
+            logger.exception("Failed to cleanup cloned repo at %s: %s", data.get('path'), e)
     await query.edit_message_text("❌ تم إلغاء النشر.")
     return ConversationHandler.END
 
@@ -1335,8 +1414,28 @@ def main():
 
     if psutil is None:
         logger.warning("psutil is not installed: CPU and memory metrics will be limited. Install requirements.txt to enable full features.")
+
+    # Initialize file logging and asyncio exception handler
+    setup_file_logging()
+    try:
+        loop = asyncio.get_event_loop()
+        loop.set_exception_handler(asyncio_exception_handler)
+    except Exception as e:
+        logger.warning("Failed to set asyncio exception handler: %s", e)
+
     print("🚀 NeuroHost V4 – Time, Power & Smart Hosting Edition is running...")
-    app.run_polling()
+    try:
+        app.run_polling()
+    except Exception as e:
+        logger.exception("Fatal error while running the bot: %s", e)
+        # also write a compact entry to the error file
+        try:
+            with open(ERROR_LOG_FILE, 'a', encoding='utf-8') as ef:
+                import traceback
+                ef.write(f"\n===== Fatal run_polling exception: {datetime.utcnow().isoformat()} =====\n")
+                traceback.print_exc(file=ef)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
