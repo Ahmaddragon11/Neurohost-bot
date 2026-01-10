@@ -17,6 +17,7 @@ try:
 except ImportError:
     psutil = None
 import re
+import html
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, constants
 from telegram.ext import (
@@ -579,36 +580,47 @@ class ProcessManager:
         while bot_id in self.processes and self.processes[bot_id].poll() is None:
             await asyncio.sleep(2)
             if os.path.exists(log_file) and os.path.getsize(log_file) > last_pos:
-                with open(log_file, 'r') as f:
-                    f.seek(last_pos)
-                    lines = f.readlines()
-                    new_errors = []
-                    for line in lines:
-                        if "ERROR" in line.upper() or "CRITICAL" in line.upper() or "TRACEBACK" in line.upper() or "EXCEPTION" in line.upper():
-                            new_errors.append(line)
-                        elif not any(x in line.upper() for x in ["INFO", "DEBUG", "HTTP REQUEST"]):
-                            new_errors.append(line)
-                    if new_errors:
-                        error_text = "".join(new_errors).strip()
-                        if error_text:
-                            db.add_error_log(bot_id, error_text)
-                            try:
-                                bot_info = db.get_bot(bot_id)
-                                await application.bot.send_message(
-                                    chat_id=user_id,
-                                    text=f"⚠️ *تنبيه خطأ حقيقي في البوت: {bot_info[3]}*\n\n```\n{error_text[:500]}\n```",
-                                    parse_mode="Markdown"
-                                )
-                            except Exception as e:
-                                logger.exception("Failed to send error notification to user %s for bot %s: %s", user_id, bot_id, e)
-                last_pos = os.path.getsize(log_file)
+                try:
+                    with open(log_file, 'r') as f:
+                        f.seek(last_pos)
+                        lines = f.readlines()
+                        new_errors = []
+                        for line in lines:
+                            if "ERROR" in line.upper() or "CRITICAL" in line.upper() or "TRACEBACK" in line.upper() or "EXCEPTION" in line.upper():
+                                new_errors.append(line)
+                            elif not any(x in line.upper() for x in ["INFO", "DEBUG", "HTTP REQUEST"]):
+                                new_errors.append(line)
+                        if new_errors:
+                            error_text = "".join(new_errors).strip()
+                            if error_text:
+                                db.add_error_log(bot_id, error_text)
+                                try:
+                                    bot_info = db.get_bot(bot_id)
+                                    # Use HTML escaping and parse_mode to avoid Markdown errors
+                                    safe_error = html.escape(error_text[:500])
+                                    await application.bot.send_message(
+                                        chat_id=user_id,
+                                        text=f"⚠️ <b>تنبيه خطأ حقيقي في البوت: {html.escape(bot_info[3])}</b>\n\n<code>{safe_error}</code>",
+                                        parse_mode="HTML"
+                                    )
+                                except Exception as e:
+                                    logger.exception("Failed to send error notification to user %s for bot %s: %s", user_id, bot_id, e)
+                    last_pos = os.path.getsize(log_file)
+                except Exception as e:
+                    logger.exception(f"Error while reading bot log file {log_file}: {e}")
 
     def stop_bot(self, bot_id):
         bot_data = db.get_bot(bot_id)
         pid = bot_data[7] if bot_data else None
         if pid:
             try:
-                os.killpg(os.getpgid(pid), signal.SIGTERM)
+                # Check if process exists before trying to kill it
+                if psutil and psutil.pid_exists(pid):
+                    os.killpg(os.getpgid(pid), signal.SIGTERM)
+                else:
+                    logger.info(f"Process {pid} for bot {bot_id} already terminated.")
+            except (ProcessLookupError, NoSuchProcess) as e:
+                logger.info(f"Process {pid} for bot {bot_id} not found during stop_bot.")
             except Exception as e:
                 logger.exception("Failed to terminate process %s for bot %s: %s", pid, bot_id, e)
         if bot_id in self.processes: del self.processes[bot_id]
@@ -621,9 +633,12 @@ class ProcessManager:
         pid = bot_data[7] if bot_data else None
         if pid:
             try:
-                proc = psutil.Process(pid)
-                if proc.is_running():
-                    return proc.cpu_percent(interval=0.1), proc.memory_info().rss / 1024 / 1024
+                if psutil.pid_exists(pid):
+                    proc = psutil.Process(pid)
+                    if proc.is_running():
+                        return proc.cpu_percent(interval=0.1), proc.memory_info().rss / 1024 / 1024
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                return 0, 0
             except Exception as e:
                 logger.exception("psutil process info failed for pid %s: %s", pid, e)
                 return 0, 0
@@ -712,16 +727,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data = db.get_user(user.id)
     
     if user_data[2] == 'pending' and user.id != ADMIN_ID:
-        await update.message.reply_text("⏳ *طلبك قيد المراجعة*\nسيتم إشعارك فور موافقة المالك على دخولك.", parse_mode="Markdown")
-        await context.application.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"🔔 *طلب انضمام جديد*\nالمستخدم: @{user.username} ({user.id})",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ قبول", callback_data=f"approve_{user.id}"),
-                InlineKeyboardButton("❌ رفض", callback_data=f"reject_{user.id}")
-            ]]),
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("⏳ <b>طلبك قيد المراجعة</b>\nسيتم إشعارك فور موافقة المالك على دخولك.", parse_mode="HTML")
+        try:
+            await context.application.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"🔔 <b>طلب انضمام جديد</b>\nالمستخدم: @{user.username} (<code>{user.id}</code>)",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ قبول", callback_data=f"approve_{user.id}"),
+                    InlineKeyboardButton("❌ رفض", callback_data=f"reject_{user.id}")
+                ]]),
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.exception(f"Failed to notify admin about new user {user.id}: {e}")
         return
 
     if user_data[2] == 'blocked':
@@ -754,6 +772,7 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Stop any active auto-refresh for this user
+    context.user_data['menu_token'] = context.user_data.get('menu_token', 0) + 1
     context.user_data['auto_refresh'] = False
 
     keyboard = [
@@ -774,52 +793,79 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- AUTO REFRESH LOGIC ---
 async def auto_refresh_task(update: Update, context: ContextTypes.DEFAULT_TYPE, bot_id):
     user_id = update.effective_user.id
+    # Unique ID for the current menu context to detect if we switched away
+    current_menu_token = context.user_data.get('menu_token', 0) + 1
+    context.user_data['menu_token'] = current_menu_token
     context.user_data['auto_refresh'] = True
     
+    # Track the last update time to avoid flooding
+    last_update = 0
+    refresh_interval = 10 
+
     while context.user_data.get('auto_refresh', False):
-        await asyncio.sleep(2) # Refresh every 2 seconds to avoid flood
-        if not context.user_data.get('auto_refresh', False): break
-        
-        bot = db.get_bot(bot_id)
-        if not bot: break
-        
-        cpu, mem = pm.get_bot_usage(bot_id)
-        status_icon = "🟢" if bot[4] == "running" else "🔴"
-        
-        text = (
-            f"🤖 *إدارة البوت: {bot[3]}*\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"🆔 ID: `{bot[0]}`\n"
-            f"📡 الحالة: {status_icon} {bot[4]}\n"
-            f"🖥 المعالج: `{cpu}%`\n"
-            f"🧠 الذاكرة: `{mem:.2f} MB`\n"
-            f"📄 الملف: `{bot[6]}`\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"⏱ _تحديث تلقائي نشط..._"
-        )
-        
-        keyboard = []
-        if bot[4] == "stopped":
-            keyboard.append([InlineKeyboardButton("▶️ تشغيل", callback_data=f"start_{bot_id}")])
-        else:
-            keyboard.append([InlineKeyboardButton("⏹ إيقاف", callback_data=f"stop_{bot_id}")])
-        
-        keyboard.extend([
-            [InlineKeyboardButton("📂 الملفات", callback_data=f"files_{bot_id}"), InlineKeyboardButton("📜 السجلات", callback_data=f"logs_{bot_id}")],
-            [InlineKeyboardButton("🗑 حذف البوت", callback_data=f"confirm_del_{bot_id}")],
-            [InlineKeyboardButton("🔙 عودة", callback_data="my_bots")]
-        ])
-        
         try:
-            await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+            # If the menu token changed, it means the user moved to another screen
+            if context.user_data.get('menu_token') != current_menu_token:
+                break
+
+            await asyncio.sleep(1)
+            if not context.user_data.get('auto_refresh', False): break
+            
+            now = time.time()
+            if now - last_update < refresh_interval:
+                continue
+
+            bot = db.get_bot(bot_id)
+            if not bot: break
+            
+            cpu, mem = pm.get_bot_usage(bot_id)
+            status_icon = "🟢" if bot[4] == "running" else "🔴"
+            
+            # Using HTML for safer formatting
+            text = (
+                f"🤖 <b>إدارة البوت: {html.escape(bot[3])}</b>\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"🆔 ID: <code>{bot[0]}</code>\n"
+                f"📡 الحالة: {status_icon} {bot[4]}\n"
+                f"🖥 المعالج: <code>{cpu}%</code>\n"
+                f"🧠 الذاكرة: <code>{mem:.2f} MB</code>\n"
+                f"📄 الملف: <code>{html.escape(bot[6])}</code>\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"⏱ <i>تحديث تلقائي نشط (كل {refresh_interval} ثوانٍ)...</i>"
+            )
+            
+            keyboard = []
+            if bot[4] == "stopped":
+                keyboard.append([InlineKeyboardButton("▶️ تشغيل", callback_data=f"start_{bot_id}")])
+            else:
+                keyboard.append([InlineKeyboardButton("⏹ إيقاف", callback_data=f"stop_{bot_id}")])
+            
+            keyboard.extend([
+                [InlineKeyboardButton("📂 الملفات", callback_data=f"files_{bot_id}"), InlineKeyboardButton("📜 السجلات", callback_data=f"logs_{bot_id}")],
+                [InlineKeyboardButton("🗑 حذف البوت", callback_data=f"confirm_del_{bot_id}")],
+                [InlineKeyboardButton("🔙 عودة", callback_data="my_bots")]
+            ])
+            
+            if context.user_data.get('menu_token') != current_menu_token:
+                break
+
+            await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+            last_update = time.time()
+
         except BadRequest as e:
             if "Message is not modified" not in str(e):
+                logger.warning(f"BadRequest in auto-refresh for bot {bot_id}: {e}")
                 context.user_data['auto_refresh'] = False
                 break
         except Exception as e:
-            logger.exception("Failed to update auto-refresh message for user %s, bot %s: %s", update.effective_user.id if update and update.effective_user else 'unknown', bot_id if 'bot_id' in locals() else 'unknown', e)
-            context.user_data['auto_refresh'] = False
-            break
+            import telegram
+            if isinstance(e, telegram.error.RetryAfter):
+                logger.warning(f"Flood limit reached. Retry after {e.retry_after}s")
+                await asyncio.sleep(e.retry_after)
+            else:
+                logger.exception("Failed to update auto-refresh message for user %s, bot %s: %s", user_id, bot_id, e)
+                context.user_data['auto_refresh'] = False
+                break
 
 # --- BOT DETAILS & FEEDBACK ---
 async def bot_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -867,6 +913,10 @@ async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def manage_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    # Cancel previous refresh if any
+    context.user_data['menu_token'] = context.user_data.get('menu_token', 0) + 1
+    context.user_data['auto_refresh'] = False
+    
     bot_id = int(query.data.split("_")[1])
     bot = db.get_bot(bot_id)
     if not bot:
@@ -915,6 +965,10 @@ async def manage_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def view_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    # Signal that we're moving away from the manage_bot menu
+    context.user_data['menu_token'] = context.user_data.get('menu_token', 0) + 1
+    context.user_data['auto_refresh'] = False
+    
     bot_id = int(query.data.split("_")[1])
     logs = db.get_bot_logs(bot_id)
     
@@ -931,6 +985,10 @@ async def view_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_time_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    # Signal that we're moving away from the manage_bot menu
+    context.user_data['menu_token'] = context.user_data.get('menu_token', 0) + 1
+    context.user_data['auto_refresh'] = False
+    
     bot_id = int(query.data.split("_")[1])
     bot = db.get_bot(bot_id)
     if not bot:
@@ -1043,6 +1101,7 @@ async def add_time_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def my_bots(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    context.user_data['menu_token'] = context.user_data.get('menu_token', 0) + 1
     context.user_data['auto_refresh'] = False
     bots = db.get_user_bots(update.effective_user.id)
     
@@ -1118,23 +1177,39 @@ async def list_pending_users(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    action, user_id = query.data.split("_")
-    user_id = int(user_id)
-    if action == "approve":
-        db.update_user_status(user_id, 'approved')
-        await query.edit_message_text(f"✅ تم قبول {user_id}")
-        try:
-            await context.bot.send_message(chat_id=user_id, text="🎉 تم قبول طلبك!")
-        except Exception as e:
-            logger.exception("Failed to send approval message to user %s: %s", user_id, e)
-    else:
-        db.update_user_status(user_id, 'blocked')
-        await query.edit_message_text(f"❌ تم حظر {user_id}")
+    try:
+        data_parts = query.data.split("_")
+        if len(data_parts) < 2:
+            return
+        action = data_parts[0]
+        user_id = int(data_parts[1])
+        
+        if action == "approve":
+            db.update_user_status(user_id, 'approved')
+            await query.edit_message_text(f"✅ تم قبول المستخدم <code>{user_id}</code> بنجاح.", parse_mode="HTML")
+            try:
+                await context.bot.send_message(chat_id=user_id, text="🎉 <b>تم قبول طلبك بنجاح!</b> يمكنك الآن استخدام البوت عبر /start", parse_mode="HTML")
+            except Exception as e:
+                logger.warning(f"Could not send notification to user {user_id}: {e}")
+        elif action == "reject":
+            db.update_user_status(user_id, 'blocked')
+            await query.edit_message_text(f"❌ تم رفض وحظر المستخدم <code>{user_id}</code>.", parse_mode="HTML")
+            try:
+                await context.bot.send_message(chat_id=user_id, text="🚫 نعتذر، تم رفض طلب انضمامك.")
+            except Exception as e:
+                logger.warning(f"Could not send notification to user {user_id}: {e}")
+    except Exception as e:
+        logger.exception(f"Error in handle_approval: {e}")
+        await query.edit_message_text(f"❌ حدث خطأ أثناء معالجة الطلب: {e}")
 
 # --- FILE MANAGEMENT ---
 async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    # Signal that we're moving away from the manage_bot menu
+    context.user_data['menu_token'] = context.user_data.get('menu_token', 0) + 1
+    context.user_data['auto_refresh'] = False
+    
     bot_id = int(query.data.split("_")[1])
     bot = db.get_bot(bot_id)
     bot_path = os.path.join(BOTS_DIR, bot[5])
@@ -1337,6 +1412,10 @@ async def stop_bot_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    # Signal that we're moving away from the manage_bot menu
+    context.user_data['menu_token'] = context.user_data.get('menu_token', 0) + 1
+    context.user_data['auto_refresh'] = False
+    
     bot_id = int(query.data.split("_")[2])
     keyboard = [[InlineKeyboardButton("✅ حذف", callback_data=f"del_{bot_id}"), InlineKeyboardButton("❌ تراجع", callback_data=f"manage_{bot_id}")]]
     await query.edit_message_text("⚠️ حذف نهائي؟", reply_markup=InlineKeyboardMarkup(keyboard))
