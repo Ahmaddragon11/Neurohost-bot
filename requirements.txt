@@ -1,0 +1,3 @@
+python-telegram-bot>=20.0
+psutil>=5.9
+gitpython>=3.1

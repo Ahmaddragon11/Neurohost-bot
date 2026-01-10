@@ -1,5 +1,5 @@
 # -----------------------------------------------------------------------------
-# NEUROHOST BOT CONTROLLER V3.5 - CREATIVE EDITION
+# NEUROHOST BOT CONTROLLER V4 - Time, Power & Smart Hosting Edition
 # -----------------------------------------------------------------------------
 import os
 import sys
@@ -45,6 +45,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --- Helpers for V4 ---
+
+def seconds_to_human(s):
+    if s is None: return "--"
+    s = int(s)
+    days, s = divmod(s, 86400)
+    hours, s = divmod(s, 3600)
+    minutes, seconds = divmod(s, 60)
+    parts = []
+    if days: parts.append(f"{days}d")
+    if hours: parts.append(f"{hours}h")
+    if minutes: parts.append(f"{minutes}m")
+    parts.append(f"{seconds}s")
+    return ' '.join(parts)
+
+
+def render_bar(percent, length=12):
+    try:
+        p = max(0, min(100, int(percent)))
+    except:
+        p = 0
+    full = int((p / 100.0) * length)
+    return '█' * full + '░' * (length - full) + f" {p}%"
+
+
 # -----------------------------------------------------------------------------
 # DATABASE MANAGER
 # -----------------------------------------------------------------------------
@@ -56,15 +81,19 @@ class Database:
     def init_db(self):
         conn = sqlite3.connect(self.db_file)
         c = conn.cursor()
+        # Users table with plan and daily recovery tracking
         c.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
                 status TEXT DEFAULT 'pending',
                 bot_limit INTEGER DEFAULT 3,
+                plan TEXT DEFAULT 'free',
+                last_recovery_date DATE DEFAULT NULL,
                 joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # Bots table extended with time/power/sleep/restart fields (appended to keep compatibility)
         c.execute('''
             CREATE TABLE IF NOT EXISTS bots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,6 +105,18 @@ class Database:
                 main_file TEXT DEFAULT 'main.py',
                 pid INTEGER DEFAULT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                -- New columns appended for V4
+                start_time INTEGER DEFAULT NULL,
+                total_seconds INTEGER DEFAULT 0,
+                remaining_seconds INTEGER DEFAULT 0,
+                power_max REAL DEFAULT 100.0,
+                power_remaining REAL DEFAULT 100.0,
+                last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                sleep_mode INTEGER DEFAULT 0,
+                auto_recovery_used INTEGER DEFAULT 0,
+                restart_count INTEGER DEFAULT 0,
+                last_restart_at TIMESTAMP DEFAULT NULL,
+                last_sleep_reason TEXT DEFAULT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(user_id)
             )
         ''')
@@ -96,6 +137,31 @@ class Database:
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        conn.commit()
+
+        # Ensure older DBs get new columns (ALTER TABLE ADD COLUMN if missing)
+        def ensure_column(table, column_def, column_name):
+            c.execute(f"PRAGMA table_info({table})")
+            cols = [r[1] for r in c.fetchall()]
+            if column_name not in cols:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {column_def}")
+
+        ensure_column('users', "plan TEXT DEFAULT 'free'", 'plan')
+        ensure_column('users', "last_recovery_date DATE DEFAULT NULL", 'last_recovery_date')
+
+        ensure_column('bots', 'start_time INTEGER DEFAULT NULL', 'start_time')
+        ensure_column('bots', 'total_seconds INTEGER DEFAULT 0', 'total_seconds')
+        ensure_column('bots', 'remaining_seconds INTEGER DEFAULT 0', 'remaining_seconds')
+        ensure_column('bots', 'power_max REAL DEFAULT 100.0', 'power_max')
+        ensure_column('bots', 'power_remaining REAL DEFAULT 100.0', 'power_remaining')
+        ensure_column('bots', "last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP", 'last_checked')
+        ensure_column('bots', 'sleep_mode INTEGER DEFAULT 0', 'sleep_mode')
+        ensure_column('bots', 'auto_recovery_used INTEGER DEFAULT 0', 'auto_recovery_used')
+        ensure_column('bots', 'restart_count INTEGER DEFAULT 0', 'restart_count')
+        ensure_column('bots', 'last_restart_at TIMESTAMP DEFAULT NULL', 'last_restart_at')
+        ensure_column('bots', "last_sleep_reason TEXT DEFAULT NULL", 'last_sleep_reason')
+        ensure_column('bots', 'warned_low INTEGER DEFAULT 0', 'warned_low')
+
         conn.commit()
         conn.close()
 
@@ -131,11 +197,18 @@ class Database:
         return rows
 
     def add_bot(self, user_id, token, name, folder, main_file='main.py'):
+        # Determine defaults based on user plan
+        plan = self.get_user_plan(user_id)
+        plan_limits = {'free': 86400, 'pro': 604800, 'ultra': 10**12}
+        plan_power = {'free': 30.0, 'pro': 60.0, 'ultra': 100.0}
+        total_seconds = plan_limits.get(plan, 86400)
+        power = plan_power.get(plan, 30.0)
+
         conn = sqlite3.connect(self.db_file)
         c = conn.cursor()
         try:
-            c.execute("INSERT INTO bots (user_id, token, name, folder, main_file) VALUES (?, ?, ?, ?, ?)", 
-                      (user_id, token, name, folder, main_file))
+            c.execute("INSERT INTO bots (user_id, token, name, folder, main_file, total_seconds, remaining_seconds, power_max, power_remaining) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", 
+                      (user_id, token, name, folder, main_file, total_seconds, total_seconds, power, power))
             bot_id = c.lastrowid
             conn.commit()
             return bot_id
@@ -195,6 +268,110 @@ class Database:
         conn.commit()
         conn.close()
 
+    # -- New utilities for time/power systems --
+    def set_bot_time_power(self, bot_id, total_seconds, power_max):
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("UPDATE bots SET total_seconds = ?, remaining_seconds = ?, power_max = ?, power_remaining = ? WHERE id = ?",
+                  (total_seconds, total_seconds, power_max, power_max, bot_id))
+        conn.commit()
+        conn.close()
+
+    def get_all_running_bots(self):
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("SELECT * FROM bots WHERE status = 'running'")
+        rows = c.fetchall()
+        conn.close()
+        return rows
+
+    def update_bot_resources(self, bot_id, remaining_seconds=None, power_remaining=None, last_checked=None):
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        updates = []
+        params = []
+        if remaining_seconds is not None:
+            updates.append('remaining_seconds = ?')
+            params.append(remaining_seconds)
+        if power_remaining is not None:
+            updates.append('power_remaining = ?')
+            params.append(power_remaining)
+        if last_checked is not None:
+            updates.append('last_checked = ?')
+            params.append(last_checked)
+        if not updates:
+            conn.close(); return
+        params.append(bot_id)
+        c.execute(f"UPDATE bots SET {', '.join(updates)} WHERE id = ?", params)
+        conn.commit()
+        conn.close()
+
+    def set_sleep_mode(self, bot_id, sleep=1, reason=None):
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("UPDATE bots SET sleep_mode = ?, status = 'stopped', last_sleep_reason = ? WHERE id = ?", (1 if sleep else 0, reason, bot_id))
+        conn.commit()
+        conn.close()
+
+    def can_user_recover(self, user_id):
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("SELECT last_recovery_date FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row: return False
+        last = row[0]
+        today = datetime.utcnow().date().isoformat()
+        return last != today
+
+    def use_user_recovery(self, user_id):
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        today = datetime.utcnow().date().isoformat()
+        c.execute("UPDATE users SET last_recovery_date = ? WHERE user_id = ?", (today, user_id))
+        conn.commit()
+        conn.close()
+
+    def mark_bot_auto_recovery_used(self, bot_id):
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("UPDATE bots SET auto_recovery_used = 1 WHERE id = ?", (bot_id,))
+        conn.commit()
+        conn.close()
+
+    def increment_restart(self, bot_id):
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("UPDATE bots SET restart_count = restart_count + 1, last_restart_at = ? WHERE id = ?", (datetime.utcnow().isoformat(), bot_id))
+        conn.commit()
+        conn.close()
+
+    def reset_restart_count(self, bot_id):
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("UPDATE bots SET restart_count = 0 WHERE id = ?", (bot_id,))
+        conn.commit()
+        conn.close()
+
+    def update_last_checked(self, bot_id, ts=None):
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        if ts is None: ts = datetime.utcnow().isoformat()
+        c.execute("UPDATE bots SET last_checked = ? WHERE id = ?", (ts, bot_id))
+        conn.commit()
+        conn.close()
+
+    def get_user_plan(self, user_id):
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("SELECT plan FROM users WHERE user_id = ?", (user_id,))
+        r = c.fetchone()
+        conn.close()
+        return r[0] if r else 'free'
+
+    def log_restart_event(self, bot_id, text):
+        self.add_error_log(bot_id, f"[RESTART] {text}")
+
 db = Database(DB_FILE)
 
 # -----------------------------------------------------------------------------
@@ -203,15 +380,27 @@ db = Database(DB_FILE)
 class ProcessManager:
     def __init__(self):
         self.processes = {}
+        self._monitor_task = None
+        self._enforce_task = None
+        self.restart_cooldown = 60  # seconds
+        self.restart_power_cost = 2.0  # percent
+        self.restart_time_cost = 60  # seconds
+        self.restart_anti_loop_limit = 5  # max restarts in window
+        self.restart_window_seconds = 3600  # 1 hour window for anti-loop
+        self.power_drain_factor = 0.02  # multiplier for cpu*seconds -> power%
 
-    async def start_bot(self, bot_id, application):
+    async def start_bot(self, bot_id, application, use_recovery=False):
         bot_data = db.get_bot(bot_id)
         if not bot_data: return False, "البوت غير موجود."
-        
-        _, user_id, token, name, _, folder, main_file, _, _ = bot_data
+        # indices preserved: id, user_id, token, name, status, folder, main_file, pid, created_at, start_time, total_seconds, remaining_seconds, power_max, power_remaining, last_checked, sleep_mode, ...
+        _, user_id, token, name, status, folder, main_file, _, _, start_time, total_seconds, remaining_seconds, power_max, power_remaining, last_checked, sleep_mode, auto_recovery_used, restart_count, last_restart_at, last_sleep_reason = bot_data[:20]
+
+        if sleep_mode:
+            return False, "⚠️ البوت في وضع السكون. أضف وقتًا لإعادة تشغيله."
+        if remaining_seconds <= 0 or power_remaining <= 0:
+            return False, "⚠️ انتهى وقت الاستضافة أو الطاقة. أضف وقتًا أو طاقة لإعادة التشغيل."
+
         bot_path = os.path.abspath(os.path.join(BOTS_DIR, folder))
-        
-        # Auto-install requirements
         req_path = os.path.join(bot_path, "requirements.txt")
         if os.path.exists(req_path):
             subprocess.Popen([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], cwd=bot_path)
@@ -219,13 +408,13 @@ class ProcessManager:
         try:
             env = os.environ.copy()
             env["BOT_TOKEN"] = token if token else ""
-            
+
             logs_path = os.path.join(bot_path, "logs")
             os.makedirs(logs_path, exist_ok=True)
             stderr_file = os.path.join(logs_path, "stderr.log")
-            
+
             p = subprocess.Popen(
-                [sys.executable, main_file], 
+                [sys.executable, main_file],
                 cwd=bot_path, env=env,
                 stdout=open(os.path.join(logs_path, "stdout.log"), "a"),
                 stderr=open(stderr_file, "a"),
@@ -233,28 +422,115 @@ class ProcessManager:
             )
             self.processes[bot_id] = p
             db.update_bot_status(bot_id, "running", p.pid)
-            
+            # Set start_time and last_checked if not set
+            now = int(time.time())
+            if not start_time:
+                conn = sqlite3.connect(db.db_file); c = conn.cursor(); c.execute("UPDATE bots SET start_time = ?, last_checked = ? WHERE id = ?", (now, now, bot_id)); conn.commit(); conn.close()
+            else:
+                db.update_last_checked(bot_id)
+
+            # Reset restart counter on successful start
+            db.reset_restart_count(bot_id)
+
+            # Watch errors and process exit
             asyncio.create_task(self.watch_errors(bot_id, stderr_file, user_id, application))
+            asyncio.create_task(self._watch_process_exit(bot_id, p, user_id, application))
             return True, "🚀 تم التشغيل بنجاح."
         except Exception as e:
             return False, str(e)
 
+    async def _watch_process_exit(self, bot_id, process, user_id, application):
+        # Wait for process to exit
+        while True:
+            await asyncio.sleep(1)
+            if process.poll() is not None:
+                code = process.returncode
+                db.add_error_log(bot_id, f"Process exited with code {code}")
+                # Remove from tracking
+                if bot_id in self.processes: del self.processes[bot_id]
+                # If non-zero or unexpected stop, try auto-restart
+                if code != 0:
+                    await asyncio.sleep(2)
+                    await self._handle_unexpected_exit(bot_id, user_id, application, exit_code=code)
+                break
+
+    async def _handle_unexpected_exit(self, bot_id, user_id, application, exit_code=1):
+        bot = db.get_bot(bot_id)
+        if not bot: return
+        # check sleep or expired
+        sleep_mode = bot[15]
+        remaining_seconds = bot[11]
+        power_remaining = bot[13]
+        # correct indices: auto_recovery_used = 16, restart_count = 17, last_restart_at = 18
+        auto_recovery_used = bot[16]
+        restart_count = bot[17]
+        last_restart_at = bot[18]
+
+        # Anti-loop: decline if too many restarts in window
+        if restart_count >= self.restart_anti_loop_limit:
+            db.set_sleep_mode(bot_id, True, reason="anti_loop")
+            db.log_restart_event(bot_id, "Auto-restart disabled due to too many restarts.")
+            try: await application.bot.send_message(chat_id=bot[1], text=f"⚠️ البوت {bot[3]} تم إيقافه آلياً بسبب تكرار الإعادات.")
+            except: pass
+            return
+
+        # Check cooldown
+        if last_restart_at:
+            try:
+                lr = datetime.fromisoformat(last_restart_at)
+                if (datetime.utcnow() - lr).total_seconds() < self.restart_cooldown:
+                    db.log_restart_event(bot_id, "Restart skipped due to cooldown.")
+                    return
+            except: pass
+
+        # If no time/power, try auto-recovery (if user still has daily recovery and not used for this bot)
+        if (remaining_seconds <= 0 or power_remaining <= 0) and db.can_user_recover(bot[1]) and auto_recovery_used == 0:
+            # Use auto-recovery: one free restart
+            db.use_user_recovery(bot[1])
+            db.mark_bot_auto_recovery_used(bot_id)
+            db.log_restart_event(bot_id, "Auto-recovery used to restart bot for free.")
+            success, msg = await self.start_bot(bot_id, application, use_recovery=True)
+            if success:
+                try: await application.bot.send_message(chat_id=bot[1], text=f"🔄 تم استعادة {bot[3]} باستخدام Auto-Recovery المجانية.")
+                except: pass
+                return
+
+        # If still no resources, do not restart
+        if remaining_seconds <= 0 or power_remaining <= 0 or sleep_mode:
+            db.set_sleep_mode(bot_id, True, reason="expired_or_no_power")
+            try: await application.bot.send_message(chat_id=bot[1], text=f"⚠️ البوت {bot[3]} توقف بسبب نفاد الوقت أو الطاقة ودخل وضع السكون.")
+            except: pass
+            return
+
+        # Deduct restart cost
+        new_power = max(0.0, power_remaining - self.restart_power_cost)
+        new_remaining = max(0, remaining_seconds - self.restart_time_cost)
+        db.update_bot_resources(bot_id, remaining_seconds=new_remaining, power_remaining=new_power, last_checked=datetime.utcnow().isoformat())
+        db.increment_restart(bot_id)
+        db.log_restart_event(bot_id, f"Auto-restarting after exit code {exit_code}")
+        # Attempt to restart within 5 seconds
+        await asyncio.sleep(3)
+        success, msg = await self.start_bot(bot_id, application)
+        if success:
+            try: await application.bot.send_message(chat_id=bot[1], text=f"♻️ تم إعادة تشغيل البوت {bot[3]} تلقائياً.")
+            except: pass
+        else:
+            db.log_restart_event(bot_id, f"Auto-restart failed: {msg}")
+
     async def watch_errors(self, bot_id, log_file, user_id, application):
-        last_pos = os.path.getsize(log_file)
+        last_pos = os.path.getsize(log_file) if os.path.exists(log_file) else 0
         while bot_id in self.processes and self.processes[bot_id].poll() is None:
             await asyncio.sleep(2)
-            if os.path.getsize(log_file) > last_pos:
+            if os.path.exists(log_file) and os.path.getsize(log_file) > last_pos:
                 with open(log_file, 'r') as f:
                     f.seek(last_pos)
                     lines = f.readlines()
                     new_errors = []
                     for line in lines:
-                        # Filter out INFO and DEBUG messages, keep only actual errors/tracebacks
                         if "ERROR" in line.upper() or "CRITICAL" in line.upper() or "TRACEBACK" in line.upper() or "EXCEPTION" in line.upper():
                             new_errors.append(line)
                         elif not any(x in line.upper() for x in ["INFO", "DEBUG", "HTTP REQUEST"]):
                             new_errors.append(line)
-                    
                     if new_errors:
                         error_text = "".join(new_errors).strip()
                         if error_text:
@@ -292,12 +568,73 @@ class ProcessManager:
             except: pass
         return 0, 0
 
+    # Background enforcement and monitoring
+    async def _enforce_loop(self, application):
+        while True:
+            try:
+                running = db.get_all_running_bots()
+                now = time.time()
+                for bot in running:
+                    bot_id = bot[0]
+                    pid = bot[7]
+                    remaining = bot[11] or 0
+                    power = bot[13] or 0.0
+                    last_checked = bot[14]
+                    warned_low = bot[20] if len(bot) > 20 else 0
+
+                    # compute elapsed since last_checked
+                    try:
+                        last_ts = int(datetime.fromisoformat(last_checked).timestamp())
+                    except:
+                        last_ts = int(now)
+                    elapsed = int(now - last_ts)
+                    if elapsed <= 0:
+                        continue
+
+                    cpu, _ = self.get_bot_usage(bot_id)
+
+                    # idle detection: if very low CPU, reduce drain multiplier
+                    drain_factor = self.power_drain_factor
+                    if cpu < 2.0:
+                        drain_factor *= 0.2
+
+                    # deduct time and power based on elapsed and CPU
+                    new_remaining = max(0, int(remaining - elapsed))
+                    power_drain = (cpu / 100.0) * elapsed * drain_factor
+                    new_power = max(0.0, float(power - power_drain))
+
+                    db.update_bot_resources(bot_id, remaining_seconds=new_remaining, power_remaining=new_power, last_checked=datetime.utcnow().isoformat())
+
+                    # Low-time warning (10 minutes)
+                    if new_remaining > 0 and new_remaining <= 600 and not warned_low:
+                        try:
+                            await application.bot.send_message(chat_id=bot[1], text=f"⚠️ تنبيه: البوت {bot[3]} سيتوقف خلال {seconds_to_human(new_remaining)}. يرجى إضافة وقت لتجنب السكون.")
+                            conn = sqlite3.connect(DB_FILE); c = conn.cursor(); c.execute("UPDATE bots SET warned_low = 1 WHERE id = ?", (bot_id,)); conn.commit(); conn.close()
+                        except: pass
+
+                    # If now expired
+                    if new_remaining == 0 or new_power == 0.0:
+                        # enforce sleep
+                        db.set_sleep_mode(bot_id, True, reason="expired")
+                        try: await application.bot.send_message(chat_id=bot[1], text=f"⚠️ البوت {bot[3]} دخل وضع السكون بسبب نفاد الوقت أو الطاقة.")
+                        except: pass
+                        self.stop_bot(bot_id)
+
+                # cleanup / sleep
+            except Exception as e:
+                logger.exception("Enforcement loop error: %s", e)
+            await asyncio.sleep(30)
+
+    async def start_background_tasks(self, application):
+        if self._enforce_task is None:
+            self._enforce_task = asyncio.create_task(self._enforce_loop(application))
+
 pm = ProcessManager()
 
 # -----------------------------------------------------------------------------
 # CONVERSATION STATES
 # -----------------------------------------------------------------------------
-WAIT_FILE_UPLOAD, WAIT_MANUAL_TOKEN, WAIT_EDIT_CONTENT, WAIT_FEEDBACK = range(4)
+WAIT_FILE_UPLOAD, WAIT_MANUAL_TOKEN, WAIT_EDIT_CONTENT, WAIT_FEEDBACK, WAIT_GITHUB_URL, WAIT_DEPLOY_CONFIRM = range(6)
 
 # -----------------------------------------------------------------------------
 # HANDLERS
@@ -325,7 +662,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     keyboard = [
-        [InlineKeyboardButton("➕ استضافة بوت جديد", callback_data="add_bot")],
+        [InlineKeyboardButton("➕ استضافة بوت جديد", callback_data="add_bot"), InlineKeyboardButton("🔁 نشر من GitHub", callback_data="deploy_github")],
         [InlineKeyboardButton("📂 بوتاتي المستضافة", callback_data="my_bots")],
         [InlineKeyboardButton("📊 حالة النظام", callback_data="sys_status")],
         [InlineKeyboardButton("ℹ️ التفاصيل والمعلومات", callback_data="bot_details")]
@@ -334,7 +671,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton("👑 لوحة التحكم", callback_data="admin_panel")])
     
     await update.message.reply_text(
-        f"🚀 *NeuroHost V3.5 - Creative Edition*\nأهلاً بك {user.first_name}!\n\n💡 _ملاحظة: البوت قيد التطوير ويتحسن باستمرار._",
+        f"🚀 *NeuroHost V4 – Time, Power & Smart Hosting Edition*\nأهلاً بك {user.first_name}!\n\n💡 _ملاحظة: البوت قيد التطوير ويتحسن باستمرار._",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
@@ -353,7 +690,7 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['auto_refresh'] = False
 
     keyboard = [
-        [InlineKeyboardButton("➕ استضافة بوت جديد", callback_data="add_bot")],
+        [InlineKeyboardButton("➕ استضافة بوت جديد", callback_data="add_bot"), InlineKeyboardButton("🔁 نشر من GitHub", callback_data="deploy_github")],
         [InlineKeyboardButton("📂 بوتاتي المستضافة", callback_data="my_bots")],
         [InlineKeyboardButton("📊 حالة النظام", callback_data="sys_status")],
         [InlineKeyboardButton("ℹ️ التفاصيل والمعلومات", callback_data="bot_details")]
@@ -422,11 +759,11 @@ async def bot_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     text = (
-        f"ℹ️ *تفاصيل NeuroHost V3.5*\n\n"
-        f"🌟 *الإصدار:* 3.5 (Creative Edition)\n"
+        f"ℹ️ *تفاصيل NeuroHost V4 – Time, Power & Smart Hosting Edition*\n\n"
+        f"🌟 *الإصدار:* 4.0 (Time & Power Edition)\n"
         f"👨‍💻 *المطور:* {DEVELOPER_USERNAME}\n"
-        f"🛠 *الحالة:* قيد التطوير المستمر\n\n"
-        f"📝 هذا البوت مصمم لتوفير بيئة استضافة آمنة وسهلة لبوتات التيليجرام مع ميزات مراقبة متقدمة.\n\n"
+        f"🛠 *الحالة:* قيد التطوير والتحسين المستمر\n\n"
+        f"📝 تم تحديث النظام لدعم إدارة الوقت والطاقة، الحماية الذكية، وإمكانية النشر من GitHub.\n\n"
         f"💡 يمكنك إرسال ملاحظاتك أو أفكارك للمطور مباشرة عبر الزر أدناه."
     )
     
@@ -463,7 +800,46 @@ async def manage_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     bot_id = int(query.data.split("_")[1])
-    
+    bot = db.get_bot(bot_id)
+    if not bot:
+        await query.edit_message_text("❌ البوت غير موجود.")
+        return
+
+    # Build initial view with time/power summary
+    remaining = bot[11]
+    power = bot[13]
+    status_icon = "🟢" if bot[4] == "running" else "🔴"
+    time_bar = render_bar((remaining / bot[10] * 100) if bot[10] else 0)
+    power_bar = render_bar(power)
+    expires_text = f"ينتهي في: {seconds_to_human(remaining)}" if remaining and remaining>0 else "منتهي"
+
+    text = (
+        f"🤖 *إدارة البوت: {bot[3]}*\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"🆔 ID: `{bot[0]}`\n"
+        f"📡 الحالة: {status_icon} {bot[4]}\n"
+        f"⏳ الوقت المتبقي: `{seconds_to_human(remaining)}` - {expires_text}\n"
+        f"{time_bar}\n"
+        f"⚡ الطاقة المتبقية: `{power}%`\n"
+        f"{power_bar}\n"
+        f"📄 الملف: `{bot[6]}`\n"
+        f"━━━━━━━━━━━━━━"
+    )
+
+    keyboard = []
+    if bot[4] == "stopped":
+        keyboard.append([InlineKeyboardButton("▶️ تشغيل", callback_data=f"start_{bot_id}")])
+    else:
+        keyboard.append([InlineKeyboardButton("⏹ إيقاف", callback_data=f"stop_{bot_id}")])
+
+    keyboard.extend([
+        [InlineKeyboardButton("⏳ Hosting Time", callback_data=f"timepanel_{bot_id}"), InlineKeyboardButton("📂 الملفات", callback_data=f"files_{bot_id}")],
+        [InlineKeyboardButton("📜 السجلات", callback_data=f"logs_{bot_id}"), InlineKeyboardButton("🗑 حذف البوت", callback_data=f"confirm_del_{bot_id}")],
+        [InlineKeyboardButton("🔙 عودة", callback_data="my_bots")]
+    ])
+
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
     # Start auto-refresh task
     asyncio.create_task(auto_refresh_task(update, context, bot_id))
 
@@ -483,6 +859,117 @@ async def view_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("🔙 عودة", callback_data=f"manage_{bot_id}")]]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
+# --- Time & Power Panel ---
+async def show_time_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    bot_id = int(query.data.split("_")[1])
+    bot = db.get_bot(bot_id)
+    if not bot:
+        await query.edit_message_text("❌ البوت غير موجود.")
+        return
+    remaining = bot[11]
+    total = bot[10]
+    power = bot[13]
+    plan = db.get_user_plan(bot[1])
+
+    text = (
+        f"⏳ *لوحة استضافة الوقت والطاقة: {bot[3]}*\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"💼 الخطة: *{plan}*\n"
+        f"⏳ الوقت المستغرق: `{seconds_to_human(total - remaining)}`\n"
+        f"🕒 المتبقي: `{seconds_to_human(remaining)}`\n"
+        f"🔚 تاريخ الانتهاء المتوقع: `{datetime.utcfromtimestamp(int(time.time()+ (remaining or 0))).isoformat()}`\n"
+        f"{render_bar((remaining / total * 100) if total else 0)}\n"
+        f"⚡ الطاقة المتبقية: `{power}%`\n"
+        f"{render_bar(power)}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"*حالة السكون:* {'✅ نشط' if bot[15]==1 else '❌ غير نشط'}\n"
+        f"*استخدام Auto-Recovery لهذه البوت:* {'✅ مستخدم' if bot[16]==1 else '❌ متاح'}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"اختر كمية وقت لإضافتها (سيتم إضافة طاقة متناسبة):"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("➕ 1 ساعة", callback_data=f"add_time_{bot_id}_3600"), InlineKeyboardButton("➕ 12 ساعة", callback_data=f"add_time_{bot_id}_43200")],
+        [InlineKeyboardButton("➕ 24 ساعة", callback_data=f"add_time_{bot_id}_86400"), InlineKeyboardButton("➕ 7 أيام", callback_data=f"add_time_{bot_id}_604800")],
+    ]
+
+    # If bot is sleeping and user can recover, show restore button
+    if bot[15] == 1 and db.can_user_recover(bot[1]):
+        keyboard.append([InlineKeyboardButton("🔧 استعادة (Auto-Recovery)", callback_data=f"recover_{bot_id}")])
+
+    keyboard.append([InlineKeyboardButton("🔙 عودة", callback_data=f"manage_{bot_id}")])
+
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def attempt_recover(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    bot_id = int(query.data.split("_")[1])
+    bot = db.get_bot(bot_id)
+    if not bot:
+        await query.edit_message_text("❌ البوت غير موجود.")
+        return
+    # Check if user allowed recovery today
+    if not db.can_user_recover(bot[1]):
+        await query.edit_message_text("❌ لقد استخدمت استعادة اليوم بالفعل. حاول غداً.")
+        return
+    # Only allow recover if bot is sleeping or stopped due to expiry
+    if bot[15] == 0:
+        await query.edit_message_text("❌ البوت ليس في وضع السكون.")
+        return
+    # Mark recovery used and reset resource minimally and attempt start
+    db.use_user_recovery(bot[1])
+    db.mark_bot_auto_recovery_used(bot_id)
+    # Give small time/power to resume (e.g., 1 hour and 20% power)
+    db.set_bot_time_power(bot_id, total_seconds=3600, power_max=20.0)
+    db.update_bot_resources(bot_id, remaining_seconds=3600, power_remaining=20.0, last_checked=datetime.utcnow().isoformat())
+    db.set_sleep_mode(bot_id, False)
+    success, msg = await pm.start_bot(bot_id, context.application, use_recovery=True)
+    if success:
+        await query.edit_message_text("✅ تم استعادة البوت وتشغيله باستخدام Auto-Recovery المجانية.")
+    else:
+        await query.edit_message_text(f"⚠️ تم استعادة الموارد لكن فشل التشغيل: {msg}")
+
+async def add_time_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split("_")
+    bot_id = int(parts[2]); seconds = int(parts[3])
+    bot = db.get_bot(bot_id)
+    if not bot:
+        await query.edit_message_text("❌ البوت غير موجود.")
+        return
+    user_plan = db.get_user_plan(bot[1])
+    plan_limits = {'free': 86400, 'pro': 604800, 'ultra': 10**12}
+    plan_max = plan_limits.get(user_plan, 86400)
+    current_total = bot[10] or 0
+    # Prevent exceeding plan
+    if current_total + seconds > plan_max:
+        await query.answer("⚠️ لا يمكنك تجاوز حد خطتك.")
+        return
+    # Compute proportional power to add
+    # We'll add power proportional to fraction of plan maximum added
+    added_power = min(100.0, (seconds / plan_max) * 100.0)
+    new_total = current_total + seconds
+    new_remaining = (bot[11] or 0) + seconds
+    new_power = min(100.0, (bot[13] or 0) + added_power)
+    db.update_bot_resources(bot_id, remaining_seconds=new_remaining, power_remaining=new_power, last_checked=datetime.utcnow().isoformat())
+    conn = sqlite3.connect(DB_FILE); c = conn.cursor(); c.execute("UPDATE bots SET total_seconds = ?, warned_low = 0 WHERE id = ?", (new_total, bot_id)); conn.commit(); conn.close()
+
+    # Wake up if sleeping
+    if bot[15] == 1:
+        db.set_sleep_mode(bot_id, False)
+        # attempt auto-start
+        success, msg = await pm.start_bot(bot_id, context.application)
+        if success:
+            await query.edit_message_text("✅ تمت إضافة الوقت بنجاح وتم إيقاظ البوت وتشغيله.")
+        else:
+            await query.edit_message_text(f"✅ تمت إضافة الوقت بنجاح. ولكن: {msg}")
+    else:
+        await query.edit_message_text("✅ تمت إضافة الوقت والطاقة بنجاح.")
+
 # --- OTHER HANDLERS (SAME AS V3 BUT UPDATED UI) ---
 async def my_bots(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -497,7 +984,12 @@ async def my_bots(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
     for bid, name, status, _ in bots:
         icon = "🟢" if status == "running" else "🔴"
-        keyboard.append([InlineKeyboardButton(f"{icon} {name}", callback_data=f"manage_{bid}")])
+        bot = db.get_bot(bid)
+        remaining = bot[11]
+        expires = seconds_to_human(remaining) if remaining and remaining>0 else "منتهي"
+        sleep_icon = " 🛌" if bot[15]==1 else ""
+        label = f"{icon} {name}{sleep_icon} — ⏳ {expires} — ⚡ {int(bot[13] or 0)}%"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"manage_{bid}")])
     
     keyboard.append([InlineKeyboardButton("🔙 عودة", callback_data="main_menu")])
     await query.edit_message_text("📂 *قائمة بوتاتك المستضافة:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -648,6 +1140,108 @@ async def handle_manual_token(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text("✅ تمت الإضافة بنجاح!")
     return ConversationHandler.END
 
+# --- GITHUB DEPLOY FLOW ---
+async def deploy_github_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text("🔗 أرسل رابط GitHub (مثال: https://github.com/username/repo):")
+    return WAIT_GITHUB_URL
+
+async def handle_github_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
+    user = update.effective_user
+    # Basic validation
+    if not url.startswith('https://github.com/'):
+        await update.message.reply_text("❌ رابط غير صالح. الرجاء إرسال عنوان مستودع GitHub صالح.")
+        return WAIT_GITHUB_URL
+
+    folder = f"gh_{user.id}_{int(time.time())}"
+    dest = os.path.join(BOTS_DIR, folder)
+    try:
+        # Attempt to clone
+        proc = subprocess.run(["git", "clone", url, dest], capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            await update.message.reply_text(f"❌ فشل الاستنساخ: {proc.stderr[:500]}")
+            return ConversationHandler.END
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطأ أثناء الاستنساخ: {e}")
+        return ConversationHandler.END
+
+    # Detect main file
+    candidates = ['main.py', 'bot.py', 'app.py']
+    found = None
+    for c in candidates:
+        for root, dirs, files in os.walk(dest):
+            if c in files:
+                rel = os.path.relpath(os.path.join(root, c), dest)
+                found = rel
+                break
+        if found: break
+
+    # Detect token in files
+    token = None
+    for root, dirs, files in os.walk(dest):
+        for f in files:
+            if f.endswith('.py'):
+                try:
+                    with open(os.path.join(root, f), 'r', encoding='utf-8') as fh:
+                        data = fh.read()
+                        m = re.search(r'[0-9]{8,10}:[a-zA-Z0-9_-]{35}', data)
+                        if m:
+                            token = m.group(0)
+                            break
+                except: pass
+        if token: break
+
+    # Detect requirements
+    req_found = False
+    for root, dirs, files in os.walk(dest):
+        if 'requirements.txt' in files:
+            req_found = True
+            break
+
+    context.user_data['gh_deploy'] = {'folder': folder, 'path': dest, 'main_file': found, 'token': token, 'has_reqs': req_found}
+
+    text = f"🔎 تم استنساخ المستودع. تم اكتشاف ملف التشغيل: `{found or 'غير موجود'}`\n"
+    if req_found:
+        text += "🔧 يوجد ملف requirements.txt وسيتم تثبيت الحزم عند التشغيل الأول تلقائياً.\n"
+    if token:
+        text += "✅ تم اكتشاف توكن داخل المشروع، سيتم عرضه عند النشر.\n"
+    else:
+        text += "⚠️ لم يتم اكتشاف توكن تلقائياً. ستحتاج لإدخاله يدوياً بعد النشر أو إضافته في إعدادات المشروع.\n"
+    text += "\nهل تريد نشر هذا المستودع كبوت؟"
+
+    keyboard = [[InlineKeyboardButton("✅ نشر", callback_data="gh_confirm")], [InlineKeyboardButton("❌ إلغاء", callback_data="gh_cancel")]]
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    return WAIT_DEPLOY_CONFIRM
+
+async def handle_gh_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = context.user_data.get('gh_deploy')
+    if not data:
+        await query.edit_message_text("❌ لا توجد بيانات للنشر.")
+        return ConversationHandler.END
+    folder = data['folder']
+    main_file = data['main_file'] or 'main.py'
+    token = data['token']
+    # Register bot
+    name = os.path.basename(folder)
+    bot_id = db.add_bot(update.effective_user.id, token, name, folder, main_file)
+    await query.edit_message_text(f"✅ تم نشر المستودع كبوت بنجاح. ID: {bot_id}")
+    return ConversationHandler.END
+
+async def handle_gh_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = context.user_data.get('gh_deploy')
+    if data:
+        # cleanup cloned folder
+        try: shutil.rmtree(data['path'], ignore_errors=True)
+        except: pass
+    await query.edit_message_text("❌ تم إلغاء النشر.")
+    return ConversationHandler.END
+
 # --- ACTIONS ---
 async def start_bot_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -704,9 +1298,21 @@ def main():
         fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)]
     )
 
+    gh_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(deploy_github_start, pattern="^deploy_github$")],
+        states={
+            WAIT_GITHUB_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_github_url)],
+            WAIT_DEPLOY_CONFIRM: [CallbackQueryHandler(handle_gh_confirm, pattern="^gh_confirm$"), CallbackQueryHandler(handle_gh_cancel, pattern="^gh_cancel$")]
+        },
+        fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)]
+    )
+
     app.add_handler(CommandHandler("start", start))
+    # Start background enforcement/monitor tasks when app starts
+    app.post_init = lambda _: asyncio.create_task(pm.start_background_tasks(app))
     app.add_handler(add_bot_conv)
     app.add_handler(feedback_conv)
+    app.add_handler(gh_conv)
     app.add_handler(CallbackQueryHandler(main_menu, pattern="^main_menu$"))
     app.add_handler(CallbackQueryHandler(my_bots, pattern="^my_bots$"))
     app.add_handler(CallbackQueryHandler(manage_bot, pattern="^manage_"))
@@ -723,8 +1329,13 @@ def main():
     app.add_handler(CallbackQueryHandler(list_files, pattern="^files_"))
     app.add_handler(CallbackQueryHandler(file_view, pattern="^fview_"))
     app.add_handler(CallbackQueryHandler(file_delete, pattern="^fdel_"))
+    app.add_handler(CallbackQueryHandler(show_time_panel, pattern="^timepanel_"))
+    app.add_handler(CallbackQueryHandler(add_time_action, pattern="^add_time_"))
+    app.add_handler(CallbackQueryHandler(attempt_recover, pattern="^recover_"))
 
-    print("🚀 NeuroHost V3.5 is running...")
+    if psutil is None:
+        logger.warning("psutil is not installed: CPU and memory metrics will be limited. Install requirements.txt to enable full features.")
+    print("🚀 NeuroHost V4 – Time, Power & Smart Hosting Edition is running...")
     app.run_polling()
 
 if __name__ == "__main__":
